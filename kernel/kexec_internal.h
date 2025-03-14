@@ -47,6 +47,7 @@ int kho_locate_mem_hole(struct kexec_buf *kbuf,
 			int (*func)(struct resource *, void *));
 int kho_fill_kimage(struct kimage *image);
 int kho_copy_fdt(struct kimage *image);
+void kexec_pre_reboot_record(void);
 #else
 static inline int kho_locate_mem_hole(struct kexec_buf *kbuf,
 				      int (*func)(struct resource *, void *))

@@ -9,6 +9,10 @@
 #include <linux/kexec.h>
 #include <linux/kexec_handover.h>
 #include <linux/sort.h>
+#include <linux/timer.h>
+#include <asm/timer.h>
+
+#include "kexec_internal.h"
 
 struct timestamp_info {
 	char *name;
@@ -22,6 +26,13 @@ static struct timestamp_info *ts_array;
 static char *ts_events;
 static atomic_t ts_index;
 static atomic_t event_index;
+/* offset variables */
+unsigned long long tsc_new;
+unsigned long long tsc_old;
+unsigned long sclock_new;
+unsigned long sclock_old;
+unsigned long kexec_sched_clock_offset = 0;
+bool reboot = false;
 
 int kexec_timestamp(char *event_name);
 
@@ -40,8 +51,25 @@ static int add_timestamp_to_telemetry_array(struct timestamp_info ts_info, char 
 	strcpy(event_pos, event_name);
 	ts_info.name = event_pos;
 
+	ts_info.ts += kexec_sched_clock_offset;
 	ts_array[index] = ts_info;
 	return 0;
+}
+
+static void set_sched_clock_offset(void)
+{
+	unsigned long long tsc_new = rdtsc_ordered();
+	unsigned long sclock_new = native_sched_clock();
+	if (tsc_old) {
+		kexec_sched_clock_offset = native_sched_clock_from_tsc(tsc_new) -
+	native_sched_clock_from_tsc(tsc_old) + (sclock_old - sclock_new);
+	}
+}
+
+void kexec_pre_reboot_record(void)
+{
+	tsc_old = rdtsc_ordered();
+	sclock_old = native_sched_clock() + kexec_sched_clock_offset;
 }
 
 /* For kernel use */
@@ -49,7 +77,7 @@ int kexec_timestamp(char *event_name)
 {
 	struct timestamp_info ts_info;
 
-	ts_info.ts = sched_clock();
+	ts_info.ts = native_sched_clock();
 	ts_info.src_user = false;
 
 	add_timestamp_to_telemetry_array(ts_info, event_name);
@@ -86,7 +114,7 @@ static ssize_t kexec_telemetry_user_write(struct file *file,
 	char buffer[NAME_MAX];
 	int read_len = count < (sizeof(buffer) - 1) ? count-1 : (sizeof(buffer) - 1);
 
-	ts_info.ts = sched_clock();
+	ts_info.ts = native_sched_clock();
 	ts_info.src_user = true;
 
 	if (copy_from_user(buffer, buf, read_len)) {
@@ -107,8 +135,8 @@ static int kexec_telemetry_show(struct seq_file *m, void *v)
 
 	seq_printf(m, "%-25s%s\n", "Event", "Timestamp");
 	seq_printf(m, "-------------------------------------\n");
+
 	// RCU read lock
-	//
 	kexec_telemetry_sort();
 
 	for (; i < index ; i++) {
@@ -167,6 +195,8 @@ static int kho_telemetry_notifier(struct notifier_block *self, unsigned long cmd
 	char *event_name_buf;
 	unsigned long *ts_buf;
 	bool *src_buf; //K:0, U:1, also TODO: use bitmap to save space
+	unsigned long *sclock_old_buf;
+	unsigned long long *tsc_old_buf;
 	size_t names_total_size = 0;
 	size_t event_count;
 	int ts_iter = 0;
@@ -183,8 +213,10 @@ static int kho_telemetry_notifier(struct notifier_block *self, unsigned long cmd
 	event_name_buf = kzalloc(names_total_size, GFP_KERNEL);
 	ts_buf = kzalloc((sizeof(unsigned long)*event_count), GFP_KERNEL);
 	src_buf = kzalloc((sizeof(bool)*event_count), GFP_KERNEL);
+	sclock_old_buf = kzalloc(sizeof(unsigned long), GFP_KERNEL);
+	tsc_old_buf = kzalloc(sizeof(unsigned long long), GFP_KERNEL);
 
-	if (!event_name_buf || !ts_buf || !src_buf)
+	if (!event_name_buf || !ts_buf || !src_buf || !sclock_old_buf || !tsc_old_buf)
 		return NOTIFY_BAD;
 
 	/* Serialize names and timestamp */
@@ -198,10 +230,16 @@ static int kho_telemetry_notifier(struct notifier_block *self, unsigned long cmd
 		name_offset += name_len;
 	}
 
+	/* Serialize preboot values */
+	sclock_old_buf[0] = sclock_old;
+	tsc_old_buf[0] = tsc_old;
+
 	kho_add_node(NULL, "kexec_telemetry", &telemetry_node);
 	kho_add_prop(&telemetry_node, "event_name", event_name_buf, names_total_size);
 	kho_add_prop(&telemetry_node, "timestamp", ts_buf, sizeof(unsigned long)*event_count);
 	kho_add_prop(&telemetry_node, "src", src_buf, event_count);
+	kho_add_prop(&telemetry_node, "sclock_old", sclock_old_buf, sizeof(unsigned long));
+	kho_add_prop(&telemetry_node, "tsc_old", tsc_old_buf, sizeof(unsigned long long));
 
 	return NOTIFY_DONE;
 }
@@ -229,10 +267,14 @@ static int restore_telemetry_from_kho(void)
 	int names_size = 0;
 	int ts_buf_size = 0;
 	int src_buf_size = 0;
+	int sclock_old_buf_size = 0;
+	int tsc_old_buf_size = 0;
 
 	const char *names;
 	const unsigned long *ts_buf;
 	const bool *src_buf;
+	const unsigned long *sclock_old_buf;
+	const unsigned long long *tsc_old_buf;
 
 	const char *event_name;
 
@@ -263,6 +305,21 @@ static int restore_telemetry_from_kho(void)
 		return -ENOENT;
 	}
 	event_name = names;
+
+	sclock_old_buf = fdt_getprop(fdt, offset, "sclock_old", &sclock_old_buf_size);
+	if (!sclock_old_buf) {
+		pr_err("Looking for /khodemo.sclock_old, found p=%p\n", sclock_old_buf);
+		return -ENOENT;
+	}
+
+	tsc_old_buf = fdt_getprop(fdt, offset, "tsc_old", &tsc_old_buf_size);
+	if (!tsc_old_buf) {
+		pr_err("Looking for /khodemo.tsc_old, found p=%p\n", tsc_old_buf);
+		return -ENOENT;
+	}
+
+	tsc_old = tsc_old_buf[0];
+	sclock_old = sclock_old_buf[0];
 
 	printk("%s, restoring\n", __func__);
 	for (; i < src_buf_size; i += 1) {
@@ -302,6 +359,7 @@ static int __init kexec_telemetry_init(void)
 	atomic_set(&event_index, 0);
 
 	err = restore_telemetry_from_kho();
+	set_sched_clock_offset();
 
 	register_kho_notifier(&kho_telemetry_nb);
 

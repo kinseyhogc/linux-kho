@@ -47,6 +47,7 @@
 #include <crypto/hash.h>
 #include "kexec_internal.h"
 
+void kexec_pre_reboot_record(void);
 atomic_t __kexec_lock = ATOMIC_INIT(0);
 
 /* Flag to indicate we are going to kexec a new kernel */
@@ -1053,6 +1054,7 @@ int kernel_kexec(void)
 		goto Unlock;
 	}
 
+	kexec_pre_reboot_record();
 	error = kho_copy_fdt(kexec_image);
 	if (error)
 		goto Unlock;
